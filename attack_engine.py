@@ -145,9 +145,10 @@ class AttackEngine:
                     await asyncio.sleep(0.5)
                     continue
 
+                proxies_alive = use_proxies and proxy_pool.alive_count > 100
                 batch = []
                 for _ in range(threads):
-                    if use_proxies and proxy_pool.alive_count > 0 and random.random() > 0.3:
+                    if proxies_alive and random.random() > 0.3:
                         batch.append(self._fire_proxy(base, port, method, sem, p_timeout))
                     else:
                         batch.append(self._fire_direct(d_session, base, port, method, sem))
