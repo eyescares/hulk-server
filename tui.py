@@ -6,11 +6,19 @@ Rich-based interactive dashboard with live per-port attack stats.
 """
 
 import asyncio
+import locale
 import os
 import sys
 import threading
 import time
 from typing import List, Optional
+
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+try:
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 import uvicorn
 from rich.align import Align
@@ -359,11 +367,10 @@ async def do_dashboard():
 
 async def do_scrape_proxies():
     console.print()
-    console.print("[bold cyan]🌐 Scraping proxies from 15+ public sources...[/]")
-    check = Confirm.ask("[yellow]Check proxies for liveness? (slower but cleaner)[/]", default=False, console=console)
+    console.print("[bold cyan]Scraping proxies from 15+ public sources...[/]")
 
     with console.status("[bold green]Scraping...[/]", spinner="dots"):
-        proxies = await scrape_proxies(check=check)
+        proxies = await scrape_proxies(check=False)
 
     if not proxies:
         console.print("[red]No proxies found.[/]")
