@@ -28,6 +28,7 @@ from attack_engine import engine
 from config import settings
 from models import AttackMethod, AttackStats, AttackStatus, PortStatus
 from proxy_pool import proxy_pool
+from proxy_scraper import scrape_proxies, save_proxies
 
 
 console = Console()
@@ -51,8 +52,9 @@ MENU_OPTIONS = {
     "1": "Launch Attack",
     "2": "Stop Attack",
     "3": "Live Dashboard",
-    "4": "Load Proxies",
-    "5": "Settings",
+    "4": "Auto-Scrape Proxies",
+    "5": "Load Proxies from File",
+    "6": "Settings",
     "0": "Exit",
 }
 
@@ -346,8 +348,26 @@ async def do_dashboard():
         pass
 
 
+async def do_scrape_proxies():
+    console.print()
+    console.print("[bold cyan]🌐 Scraping proxies from 15+ public sources...[/]")
+    check = Confirm.ask("[yellow]Check proxies for liveness? (slower but cleaner)[/]", default=False, console=console)
+
+    with console.status("[bold green]Scraping...[/]", spinner="dots"):
+        proxies = await scrape_proxies(check=check)
+
+    if not proxies:
+        console.print("[red]No proxies found.[/]")
+        return
+
+    path = "proxies.txt"
+    save_proxies(proxies, path)
+    count = proxy_pool.load_file(path)
+    console.print(f"[bold green]✅ Scraped {len(proxies)} proxies, loaded {count} into pool.[/]")
+
+
 def do_load_proxies():
-    path = Prompt.ask("[bold yellow]📁 Path to proxy file[/]", console=console)
+    path = Prompt.ask("[bold yellow]📁 Path to proxy file[/]", default="proxies.txt", console=console)
     count = proxy_pool.load_file(path)
     if count:
         console.print(f"[green]Loaded {count} proxies.[/]")
@@ -408,8 +428,10 @@ async def main_loop():
             elif choice == "3":
                 await do_dashboard()
             elif choice == "4":
-                do_load_proxies()
+                await do_scrape_proxies()
             elif choice == "5":
+                do_load_proxies()
+            elif choice == "6":
                 do_settings()
             elif choice == "0":
                 if engine.is_running:
