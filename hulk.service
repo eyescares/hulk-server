@@ -1,0 +1,16 @@
+[Unit]
+Description=HULK v4 Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/hulk-server
+ExecStart=/opt/hulk-server/venv/bin/python tui.py
+Restart=on-failure
+RestartSec=5
+Environment=HULK_HOST=0.0.0.0
+Environment=HULK_API_PORT=7777
+
+[Install]
+WantedBy=multi-user.target
