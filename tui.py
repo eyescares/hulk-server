@@ -315,9 +315,10 @@ async def do_attack():
         return
 
     await engine.start(target, ports, method, threads, duration, use_proxies)
-    console.print("[bold green]🔥 Attack launched![/]")
-    await asyncio.sleep(0.5)
+    console.print("[bold green]🔥 Attack launched! Opening dashboard...[/]")
+    await asyncio.sleep(1)
     await do_dashboard()
+    return
 
 
 async def do_stop():
@@ -336,14 +337,22 @@ async def do_dashboard():
 
     try:
         with Live(console=console, refresh_per_second=4, screen=False) as live:
+            idle_ticks = 0
             while True:
                 stats = engine.stats.snapshot()
-                live.update(build_dashboard(stats))
+                if engine.last_error:
+                    err_text = Text.from_markup(f"[bold red]⚠ {engine.last_error}[/]")
+                    live.update(Group(build_dashboard(stats), Align.center(err_text)))
+                else:
+                    live.update(build_dashboard(stats))
                 await asyncio.sleep(0.25)
 
                 if stats.status in (AttackStatus.FINISHED, AttackStatus.ALL_DOWN, AttackStatus.ERROR) and not engine.is_running:
-                    await asyncio.sleep(3)
-                    break
+                    idle_ticks += 1
+                    if idle_ticks > 20:
+                        break
+                else:
+                    idle_ticks = 0
     except KeyboardInterrupt:
         pass
 

