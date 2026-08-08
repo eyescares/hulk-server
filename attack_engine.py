@@ -144,10 +144,6 @@ class AttackEngine:
             while not self._stop.is_set():
                 if deadline and time.time() >= deadline:
                     break
-                ps = self.stats.ports.get(port)
-                if not ps or ps.status != PortStatus.ALIVE:
-                    await asyncio.sleep(0.5)
-                    continue
 
                 await sem.acquire()
                 if self._stop.is_set():
@@ -248,6 +244,7 @@ class AttackEngine:
     async def _health_loop(self, target):
         await asyncio.sleep(10)
         timeout = aiohttp.ClientTimeout(total=4, connect=3)
+        probe_fails = {}
         while not self._stop.is_set():
             for port, ps in list(self.stats.ports.items()):
                 if ps.status != PortStatus.ALIVE:
@@ -261,8 +258,12 @@ class AttackEngine:
                             alive = True
                 except Exception:
                     pass
-                if not alive and ps.consecutive_fails >= 50:
-                    ps.status = PortStatus.DOWN
+                if alive:
+                    probe_fails[port] = 0
+                else:
+                    probe_fails[port] = probe_fails.get(port, 0) + 1
+                    if probe_fails[port] >= 5:
+                        ps.status = PortStatus.DOWN
             if all(ps.status != PortStatus.ALIVE for ps in self.stats.ports.values()):
                 self._stop.set()
                 self.stats.status = AttackStatus.ALL_DOWN
