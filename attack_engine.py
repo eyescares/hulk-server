@@ -147,7 +147,7 @@ class AttackEngine:
 
     async def _run(self, target, ports, method, threads, duration, use_proxies):
         deadline = time.time() + duration if duration > 0 else 0
-        conc = max(threads // max(len(ports), 1), 100)
+        conc = 100
 
         tasks = []
         for p in ports:
