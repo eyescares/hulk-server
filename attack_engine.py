@@ -122,10 +122,7 @@ class AttackEngine:
         await asyncio.gather(*tasks, return_exceptions=True)
 
         if self.stats.status == AttackStatus.RUNNING:
-            if all(ps.status != PortStatus.ALIVE for ps in self.stats.ports.values()):
-                self.stats.status = AttackStatus.ALL_DOWN
-            else:
-                self.stats.status = AttackStatus.FINISHED
+            self.stats.status = AttackStatus.FINISHED
         self.stats = self.stats.snapshot()
 
     async def _port_flood(self, target, port, method, concurrency, deadline, use_proxies):
@@ -247,8 +244,6 @@ class AttackEngine:
         probe_fails = {}
         while not self._stop.is_set():
             for port, ps in list(self.stats.ports.items()):
-                if ps.status != PortStatus.ALIVE:
-                    continue
                 url = _url(target, port)
                 alive = False
                 try:
@@ -260,14 +255,11 @@ class AttackEngine:
                     pass
                 if alive:
                     probe_fails[port] = 0
+                    ps.status = PortStatus.ALIVE
                 else:
                     probe_fails[port] = probe_fails.get(port, 0) + 1
                     if probe_fails[port] >= 5:
                         ps.status = PortStatus.DOWN
-            if all(ps.status != PortStatus.ALIVE for ps in self.stats.ports.values()):
-                self._stop.set()
-                self.stats.status = AttackStatus.ALL_DOWN
-                break
             await asyncio.sleep(10)
 
 
