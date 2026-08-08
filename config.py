@@ -6,7 +6,7 @@ from typing import List, Optional
 class Settings(BaseSettings):
     host: str = Field(default="0.0.0.0", description="API bind address")
     api_port: int = Field(default=7777, description="API port")
-    default_threads: int = Field(default=3000, description="Concurrent coroutines per attack")
+    default_threads: int = Field(default=2000, description="Concurrent coroutines per attack")
     max_threads: int = Field(default=10000, description="Hard cap on coroutines")
     request_timeout: int = Field(default=5, description="Per-request timeout in seconds")
     proxy_timeout: int = Field(default=2, description="Proxy connection timeout in seconds")
